@@ -1,0 +1,947 @@
+---
+title: "BPA calculation of BMD and overall uncertainty"
+author: "Ullrika Sahlin"
+date: "`r Sys.Date()`"
+
+params: 
+  hocs: c('immunotox','metabolic','neurotox','repro','carcino')
+  probmassoutside: 0.001
+  origALI: FALSE
+  fit_distributions: FALSE
+  Q1_ALI: c(66,66)
+  SADEP: FALSE
+  usesavedoutputs: TRUE
+  figdir: fig_linearpool
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup2, include=FALSE}
+hocs <- params$hocs
+probmassoutside <- params$probmassoutside
+origALI <- params$origALI
+fit_distributions <- params$fit_distributions
+Q1_ALI = params$Q1_ALI
+
+usesavedoutputs = params$usesavedoutputs
+SADEP = params$SADEP
+
+knitr::opts_chunk$set(dev = c('png','pdf'),#CairoPS
+                      fig.width=3.5,fig.height=3,fig.path = params$figdir)
+
+```
+
+```{r libraries}
+library('dplyr')
+library('openxlsx')
+library('fitdistrplus')
+library('SHELF')
+library('ggplot2')
+library('sn')
+library('knitr')
+```
+
+```{r}
+source('functions_BPA.R')
+breaks = c(-2,-1,0,1,2)
+limits = c(-3,3)
+limits2 = c(-3,10)
+
+#theme_set(theme_bw(base_size = 12)) 
+
+# Create a blank workbook - done in render file instead
+# OUT <- createWorkbook()
+```
+
+# Retrive data 
+
+```{r}
+#Q1_ALI = c(66,66) ## need to do when testing the code without rendering
+list_env_hocs <- pfunctions_hocs <- pfunctions_histo_hocs <- info_hocs <- env_hocs <- env_histo_hocs <- vector('list',length(hocs))
+for (f in 1:length(hocs)){ 
+  hoc <- hocs[f]
+
+  source('PBA_health_outcome_category.R')
+  pfunctions_hocs[[f]] <- pfunctions
+  pfunctions_histo_hocs[[f]] <- pfunctions_histo 
+  info_hocs[[f]] <- info
+  env_hocs[[f]] <- df_env
+  env_histo_hocs[[f]] <- df_env_histo
+  list_env_hocs[[f]] <- list_env
+}
+
+clusters <- c(unique(info_hocs[[1]]$cluster),
+              unique(info_hocs[[2]]$cluster),
+              unique(info_hocs[[3]]$cluster),
+              unique(info_hocs[[4]]$cluster),
+              unique(info_hocs[[5]]$cluster))
+
+
+```
+
+
+```{r}
+## create a modified version of get_p with the possibilty to select on expert of ALI at a time
+get_p <- function(one_dose,loo='none',p_param=TRUE,expert = 'all'){
+
+if(p_param){
+p_i <- get_env(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_hocs[[1]],expert = expert)
+p_m <- get_env(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_hocs[[2]])
+p_n <- get_env(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_hocs[[3]])
+p_r <- get_env(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_hocs[[4]])
+p_c <- get_env(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_hocs[[5]])
+}else{
+p_i <- get_env(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[1]],expert = expert)
+p_m <- get_env(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[2]])
+p_n <- get_env(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[3]])
+p_r <- get_env(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[4]])
+p_c <- get_env(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[5]])
+}
+
+return(list(lower=1 - prod(1-p_c$lower_cdf)*
+prod(1-p_i$lower_cdf)*
+prod(1-p_m$lower_cdf)*
+prod(1-p_n$lower_cdf)*
+prod(1-p_r$lower_cdf),
+upper = 1 - prod(1-p_c$upper_cdf)*
+prod(1-p_i$upper_cdf)*
+prod(1-p_m$upper_cdf)*
+prod(1-p_n$upper_cdf)*
+prod(1-p_r$upper_cdf)))
+}
+```
+
+
+```{r}
+# Derive the envelope of the probability of at least one 
+## parametric 
+dose = seq(-4,4,length.out = 400)
+
+lowup_all <- lapply(1:length(dose),function(di){get_p(dose[di])})
+
+df_env_all <- data.frame(lower_cdf=unlist(lapply(lowup_all,function(x){x$lower})),upper_cdf=unlist(lapply(lowup_all,function(x){x$upper})),dose = dose)
+
+## histogram 
+lowup_all_histo <- lapply(1:length(dose),function(di){get_p(dose[di],p_param = FALSE)})
+
+df_env_all_histo <- data.frame(lower_cdf=unlist(lapply(lowup_all_histo,function(x){x$lower})),upper_cdf=unlist(lapply(lowup_all_histo,function(x){x$upper})),dose = dose)
+```
+
+
+```{r}
+# Find 5th percentile by optimisation 
+
+## parametric
+objective1 <- function(d){(get_p(d)$lower-0.05)^2}
+
+objective2 <- function(d){(get_p(d)$upper-0.05)^2}
+
+df_opt <- data.frame(lower = optimize(objective2,interval = c(-10,10))$minimum,
+                     upper = optimize(objective1,interval = c(-10,10))$minimum,
+cdf = 0.05,mind = min(df_env_all$dose))
+
+```
+
+
+
+```{r}
+# Derive envelope with and without allergic lung inflammation 
+clid_remove = 1 #"Allergic lung inflammation "
+lowup_all <- lapply(1:length(dose),function(di){get_p(dose[di],loo=clusters[clid_remove])})
+
+df_env_all_noALI <- data.frame(lower_cdf=unlist(lapply(lowup_all,function(x){x$lower})),upper_cdf=unlist(lapply(lowup_all,function(x){x$upper})),dose = dose)
+
+objective1 <- function(d){(get_p(d,loo=clusters[clid_remove])$lower-0.05)^2}
+
+objective2 <- function(d){(get_p(d,loo=clusters[clid_remove])$upper-0.05)^2}
+
+df_opt_noALI <- data.frame(lower = optimize(objective2,interval = c(-10,10))$minimum,
+                     upper = optimize(objective1,interval = c(-10,10))$minimum,
+cdf = 0.05,mind = min(df_env_all_noALI$dose))
+
+df_opt1 <- data.frame(df_opt)
+df_opt1$lower = df_opt$upper
+df_opt1$upper = df_opt_noALI$lower
+
+```
+
+
+```{r}
+# Calculate envelopes for different choices of percentiles
+
+## parameteric 
+perc = c(0.01,0.025,seq(0.05,0.95,by=0.05))
+if(!usesavedoutputs){
+df_calc_perc <- do.call('rbind',lapply(1:length(perc),function(ip){
+objective1 <- function(d){(get_p(d)$lower-perc[ip])^2}
+
+objective2 <- function(d){(get_p(d)$upper-perc[ip])^2}
+
+df_opt <- data.frame(perc = perc[ip],
+lower = optimize(objective2,interval = c(-10,10))$minimum,
+upper = optimize(objective1,interval = c(-10,10))$minimum)
+}))
+
+save(df_calc_perc,file=paste0("env_",Q1_ALI[1],"_",Q1_ALI[2]))
+}else{
+load(file=paste0("env_",Q1_ALI[1],"_",Q1_ALI[2]))
+}
+# Add some sheets to the workbook
+# addWorksheet(OUT,paste0("env_",Q1_ALI[1],"_",Q1_ALI[2]))
+# Write the data to the sheets
+#writeData(OUT, sheet = paste0("env_",Q1_ALI[1],"_",Q1_ALI[2]), x = df_calc_perc)
+
+
+```
+
+
+```{r}
+## histogram 
+if(!usesavedoutputs){
+df_calc_perc_hist <- do.call('rbind',lapply(1:length(perc),function(ip){
+objective1 <- function(d){(get_p(d,p_param=FALSE)$lower-perc[ip])^2}
+
+objective2 <- function(d){(get_p(d,p_param=FALSE)$upper-perc[ip])^2}
+
+df_opt <- data.frame(perc = perc[ip],
+lower = optimize(objective2,interval = c(-10,10))$minimum,
+upper = optimize(objective1,interval = c(-10,10))$minimum)
+}))
+save(df_calc_perc_hist,file=paste0("env_hist",Q1_ALI[1],"_",Q1_ALI[2]))
+}else{
+load(file=paste0("env_hist",Q1_ALI[1],"_",Q1_ALI[2]))
+}
+
+# Add some sheets to the workbook
+#addWorksheet(OUT, paste0("envhisto_",Q1_ALI[1],"_",Q1_ALI[2]))
+# Write the data to the sheets
+#writeData(OUT, sheet = paste0("envhisto_",Q1_ALI[1],"_",Q1_ALI[2]), x = df_calc_perc)
+```
+
+# Sensitivity analysis envelope (repeated from combination since here we use different Q1 prob)
+
+```{r}
+## Leave one out - derive the 5th percentile for the envelope
+clusters_all <- c('all',clusters)
+if(!usesavedoutputs){
+sa_c <- do.call('rbind',lapply(1:length(clusters_all),function(clid){
+objective1 <- function(d){(get_p(d,loo=clusters_all[clid])$lower-0.05)^2}
+
+objective2 <- function(d){(get_p(d,loo=clusters_all[clid])$upper-0.05)^2}
+
+df_opt <- data.frame(lower = optimize(objective1,interval = c(-10,10))$minimum,
+upper = optimize(objective2,interval = c(-10,10))$minimum,cdf = 0.05,mind = min(df_env_all$dose),cluster = clusters_all[clid])
+}))
+save(sa_c,file=paste0("sa_c",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+  load(paste0("sa_c",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+```
+
+
+```{r sa,fig.width = 6, fig.height=3}
+ggplot(sa_c,aes(y=cluster,x=lower,fill=cluster))+
+# geom_point() + 
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=cluster))+
+ # xlim(-2,-1) + 
+#  facet_wrap(~iter) +
+  theme_bw()+
+    ylab("cluster omitted") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name="5th percentile for estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = c(-2.5,2)) +
+  ggtitle("Sensitivity analysis using leave-one-out")
+
+```
+
+
+```{r}
+## Leave one out - derive the 5th percentile for the envelope
+clid_remove = 1
+clusters_all <- c('all',clusters[-clid_remove])
+
+if(!usesavedoutputs){
+sa_c_noALI <- do.call('rbind',lapply(1:length(clusters_all),function(clid){
+objective1 <- function(d){(get_p(d,loo=c(clusters[clid_remove],clusters_all[clid]))$lower-0.05)^2}
+
+objective2 <- function(d){(get_p(d,loo=c(clusters[clid_remove],clusters_all[clid]))$upper-0.05)^2}
+
+df_opt <- data.frame(lower = optimize(objective1,interval = c(-10,10))$minimum,
+upper = optimize(objective2,interval = c(-10,10))$minimum,cdf = 0.05,mind = min(df_env_all$dose),cluster = clusters_all[clid])
+}))
+save(sa_c_noALI,file=paste0("sa_c_withoutALI",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+  load(paste0("sa_c_withoutALI",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+```
+
+
+```{r sa_withoutALI,fig.width = 6, fig.height=3}
+ggplot(sa_c_noALI,aes(y=cluster,x=lower,fill=cluster))+
+# geom_point() + 
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=cluster))+
+ # xlim(-2,-1) + 
+#  facet_wrap(~iter) +
+  theme_bw()+
+    ylab("cluster omitted") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name="5th percentile for estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = c(-2.5,2)) +
+  ggtitle("Sensitivity analysis using leave-one-out")
+
+```
+
+# SA against expert on ALI 
+
+```{r}
+## Calculate env per expert ALI
+## takes a long time to run 
+if(!usesavedoutputs){
+df_per_expert <- lapply(1:14,function(expert){
+## parametric
+all <- lapply(1:length(dose),function(di){get_p(dose[di],expert = expert)})
+## histogram 
+all_histo <- lapply(1:length(dose),function(di){get_p(dose[di],p_param = FALSE,expert = expert)})
+
+df_env_perexpert <- data.frame(dose = dose,
+lower_cdf=unlist(lapply(all,function(x){x$lower})),
+upper_cdf=unlist(lapply(all,function(x){x$upper})),
+histo_lower_cdf=unlist(lapply(all_histo,function(x){x$lower})),
+histo_upper_cdf=unlist(lapply(all_histo,function(x){x$upper})))
+df_env_perexpert$expert = LETTERS[expert]
+return(df_env_perexpert)
+})
+save(df_per_expert,file=paste0("df_per_expert",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+load(file=paste0("df_per_expert",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+```
+
+
+```{r envQ1}
+df_env_all$expert = 'all'
+ggplot(data=do.call('rbind',df_per_expert),aes(x=dose,y=100*lower_cdf,fill = expert)) +
+  geom_line(alpha=0.4)+
+  geom_line(aes(x=dose,y=100*upper_cdf),colour = 'darkred',alpha = 0.4)+
+  geom_line(data=df_env_all,aes(x=dose,y=100*upper_cdf),colour = 'blue') +
+  geom_line(data=df_env_all,aes(x=dose,y=100*lower_cdf),colour = 'blue') +
+  theme_bw()+
+  ggtitle(paste(Q1_ALI[1],"-",Q1_ALI[2],"%")) +
+  ylab("Cumulative probability (%)") +
+  scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", 
+                     breaks=breaks, labels=10^breaks,limits = c(-2.5,3))
+
+```
+
+# POOL THE ESTIMATES WITHIN EACH CLUSTER
+
+```{r}
+# Derive the linear pool of the probability of at least one for all experts 
+get_p_with_pool <- function(one_dose,loo='none',p_param=TRUE,linear_pool = TRUE,expert = 'all'){
+if(linear_pool){
+if(p_param){
+p_i <- get_linear_pool(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_hocs[[1]],expert = expert)
+p_m <- get_linear_pool(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_hocs[[2]])
+p_n <- get_linear_pool(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_hocs[[3]])
+p_r <- get_linear_pool(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_hocs[[4]])
+p_c <- get_linear_pool(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_hocs[[5]])
+}else{
+p_i <- get_linear_pool(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[1]],expert = expert)
+p_m <- get_linear_pool(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[2]])
+p_n <- get_linear_pool(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[3]])
+p_r <- get_linear_pool(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[4]])
+p_c <- get_linear_pool(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[5]])
+}
+}else{
+  if(p_param){ ##CHANGE CODE
+p_c <- get_impagg(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_hocs[[1]])
+p_i <- get_impagg(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_hocs[[2]])
+p_m <- get_impagg(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_hocs[[3]])
+p_n <- get_impagg(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_hocs[[4]])
+p_r <- get_impagg(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_hocs[[5]])
+}else{
+p_c <- get_impagg(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[1]])
+p_i <- get_impagg(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[2]])
+p_m <- get_impagg(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[3]])
+p_n <- get_impagg(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[4]])
+p_r <- get_impagg(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_histo_hocs[[5]])
+}
+}
+  if(linear_pool){
+return(list(lower_pf=1 - prod(1-p_c$lower_cdf)*
+prod(1-p_i$lower_cdf)*
+prod(1-p_m$lower_cdf)*
+prod(1-p_n$lower_cdf)*
+prod(1-p_r$lower_cdf),
+upper_pf=1 - prod(1-p_c$upper_cdf)*
+prod(1-p_i$upper_cdf)*
+prod(1-p_m$upper_cdf)*
+prod(1-p_n$upper_cdf)*
+prod(1-p_r$upper_cdf),
+mid_pf=1 - prod(1-p_c$mid_cdf)*
+prod(1-p_i$mid_cdf)*
+prod(1-p_m$mid_cdf)*
+prod(1-p_n$mid_cdf)*
+prod(1-p_r$mid_cdf)))
+  }else{
+return(list(lower_pf=1 - prod(1-p_c$lower_cdf)*
+prod(1-p_i$lower_cdf)*
+prod(1-p_m$lower_cdf)*
+prod(1-p_n$lower_cdf)*
+prod(1-p_r$lower_cdf),
+upper_pf=1 - prod(1-p_c$upper_cdf)*
+prod(1-p_i$upper_cdf)*
+prod(1-p_m$upper_cdf)*
+prod(1-p_n$upper_cdf)*
+prod(1-p_r$upper_cdf),
+conf = (sum(p_c$conf)+sum(p_i$conf) + sum(p_m$conf) + sum(p_n$conf) + sum(p_r$conf))/(nrow(p_c)+nrow(p_i)+nrow(p_m)+nrow(p_n)+nrow(p_r))))
+  }
+}
+```
+
+```{r}
+## parametric
+linear_pool_all <- lapply(1:length(dose),function(di){get_p_with_pool(dose[di])})
+## histogram 
+linear_pool_all_histo <- lapply(1:length(dose),function(di){get_p_with_pool(dose[di],p_param = FALSE)})
+```
+
+```{r}
+df_pool <- data.frame(dose = dose,
+linear_pool_lower_cdf=unlist(lapply(linear_pool_all,function(x){x$lower_pf})),
+linear_pool_upper_cdf=unlist(lapply(linear_pool_all,function(x){x$upper_pf})),
+#linear_pool_mid_cdf=unlist(lapply(linear_pool_all,function(x){x$mid_pf})),
+linear_pool_histo_lower_cdf=unlist(lapply(linear_pool_all_histo,function(x){x$lower_pf})),
+linear_pool_histo_upper_cdf=unlist(lapply(linear_pool_all_histo,function(x){x$upper_pf})))#,
+#linear_pool_histo_mid_cdf=unlist(lapply(linear_pool_all_histo,function(x){x$mid_pf})))
+df_pool$expert = 'all'
+
+```
+
+```{r}
+# Find 5th percentile by optimisation
+get_perc_expert <- function(expert){
+perc = c(0.01,0.025,seq(0.05,0.95,by=0.05))
+df_calc_perc <- do.call('rbind',lapply(1:length(perc),function(ip){
+objective1 <- function(d){(get_p_with_pool(d,expert = expert)$lower_pf-perc[ip])^2}
+
+objective2 <- function(d){(get_p_with_pool(d,expert = expert)$upper_pf-perc[ip])^2}
+
+#objective3 <- function(d){(get_p_with_pool(d,expert = expert)$mid_pf-perc[ip])^2}
+
+#objective4 <- function(d){(df_pool$linear_pool_histo_lower_cdf[max(which(df_pool$dose<=d))]-perc[ip])^2}
+
+#objective5 <- function(d){(df_pool$linear_pool_histo_upper_cdf[max(which(df_pool$dose<=d))]-perc[ip])^2}
+
+#objective6 <- function(d){(df_pool$linear_pool_histo_mid_cdf[max(which(df_pool$dose<=d))]-perc[ip])^2}
+
+df_opt <- data.frame(perc = perc[ip],
+lower = optimize(objective2,interval = c(-10,10))$minimum,
+upper = optimize(objective1,interval = c(-10,10))$minimum)#,
+#mid = optimize(objective3,interval = c(-10,10))$minimum)#,
+#lower_histo = optimize(objective5,interval = c(min(df_pool$dose),max(df_pool$dose)))$minimum,
+#upper_histo = optimize(objective4,interval = c(min(df_pool$dose),max(df_pool$dose)))$minimum,
+#mid_histo = optimize(objective6,interval = c(min(df_pool$dose),max(df_pool$dose)))$minimum)
+}))
+
+if(expert == 'all'){
+df_calc_perc$expert = 'all'
+}else{
+df_calc_perc$expert = LETTERS[expert]
+  
+}
+return(df_calc_perc)
+}
+
+df_calc_perc <- get_perc_expert(expert='all')
+```
+
+
+```{r}
+## calculate linear pool for each expert in ALI
+if(!usesavedoutputs){
+df_pool_expert <- lapply(1:14,function(expert){
+## parametric
+linear_pool_all <- lapply(1:length(dose),function(di){get_p_with_pool(dose[di],expert = expert)})
+## histogram 
+linear_pool_all_histo <- lapply(1:length(dose),function(di){get_p_with_pool(dose[di],p_param = FALSE,expert = expert)})
+
+df_pool <- data.frame(dose = dose,
+linear_pool_lower_cdf=unlist(lapply(linear_pool_all,function(x){x$lower_pf})),
+linear_pool_upper_cdf=unlist(lapply(linear_pool_all,function(x){x$upper_pf})),
+#linear_pool_mid_cdf=unlist(lapply(linear_pool_all,function(x){x$mid_pf})),
+linear_pool_histo_lower_cdf=unlist(lapply(linear_pool_all_histo,function(x){x$lower_pf})),
+linear_pool_histo_upper_cdf=unlist(lapply(linear_pool_all_histo,function(x){x$upper_pf})))#,
+#linear_pool_histo_mid_cdf=unlist(lapply(linear_pool_all_histo,function(x){x$mid_pf})))
+df_pool$expert = LETTERS[expert]
+return(df_pool)
+})
+
+## percentiles
+df_calc_perc_expert <- lapply(1:14,function(expert){
+df_calc_perc <- get_perc_expert(expert=expert)
+return(df_calc_perc)
+})
+save(df_pool_expert,df_calc_perc_expert,file=paste0("df_calc_perc_expert",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+  load(paste0("df_calc_perc_expert",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+df_calc_multi <- rbind(df_calc_perc,do.call('rbind',df_calc_perc_expert))
+# Add some sheets to the workbook
+# addWorksheet(OUT,paste0("linpool_",Q1_ALI[1],"_",Q1_ALI[2]))
+# Write the data to the sheets
+#writeData(OUT, sheet = paste0("linpool_",Q1_ALI[1],"_",Q1_ALI[2]), x = df_calc_multi[,c("perc","lower","upper")])
+
+df_cm <- df_calc_multi[,c("perc","expert","lower","upper")]
+save(df_cm,file=paste0("linpool_",Q1_ALI[1],"_",Q1_ALI[2]))
+
+df_pool_multi <- rbind(df_pool,do.call('rbind',df_pool_expert))
+df_pool_all <- df_pool[,c("dose","linear_pool_lower_cdf","linear_pool_upper_cdf")]
+df_pool_all_histo <- df_pool[,c("dose","linear_pool_histo_lower_cdf","linear_pool_histo_upper_cdf")]
+```
+
+##  Probability that the estimated lowest BMD is less than 0.93 
+
+```{r}
+get_p_with_pool(one_dose=log10(0.93),loo='none',p_param=TRUE,linear_pool = TRUE,expert = 'all')
+
+get_p_with_pool(one_dose=log10(0.93),loo='none',p_param=FALSE,linear_pool = TRUE,expert = 'all')
+```
+
+
+```{r env_linearpool}
+ggplot(data=do.call('rbind',df_pool_expert)) +
+#  geom_ribbon(aes(x=dose,ymin=linear_pool_lower_cdf,ymax=linear_pool_upper_cdf,fill=expert,color=expert),alpha = 0.1) + 
+geom_line(data=df_env_all,aes(x=dose,y=100*lower_cdf),col="black")+
+geom_line(data=df_env_all,aes(x=dose,y=100*upper_cdf),col="black")+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_lower_cdf),col="red",linetype='dashed')+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_upper_cdf),col="red",linetype='dashed')+
+  theme_bw()+
+  #scale_fill_brewer(type="qual")+
+  ggtitle(paste(Q1_ALI[1],"-",Q1_ALI[2],"%")) + 
+#  ggtitle("Uncertainty in lowest BMD across clusters",subtitle = "envelope considering differences between experts (black), \n and linear pool (red)") +
+  ylab("Cumulative probability (%)") +
+scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = c(-2.5,3))
+
+
+```
+
+
+# GRAPH COMPARING LINEAR POOL OF PARAMETRIC AND HISTOGRAM
+
+
+```{r paramhisto_15}
+# derive linear pool for histogram
+
+# compare parametric and histogram 
+ colnames(df_pool_all_histo) <-  colnames(df_pool_all)
+ df_pool_all$distribution = 'parametric'
+ df_pool_all_histo$distribution = 'histogram'
+df_ph <- rbind(df_pool_all,df_pool_all_histo)
+
+ggplot(data=df_ph,aes(x=dose,y=100*linear_pool_lower_cdf,col = distribution)) +
+  scale_color_manual(values = c('black','darkred'))+
+  geom_line()+
+  geom_line(aes(x=dose,y=100*linear_pool_upper_cdf)) + 
+  geom_hline(yintercept = 0.15*100,col='blue') +
+#  geom_segment(data=df_opt,aes(x=mind,xend=upper,y=100*cdf,yend=100*cdf),col='blue')+
+theme_bw()+
+  theme(legend.position = "none")+
+  ylab("Cumulative probability (%)") +
+  scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = NULL)
+
+```
+
+# Sensitivity analysis LEAVE ONE OUT 5 and 15th percentile 
+
+```{r sa_linearpool_5th, fig.width = 6, fig.height = 3}
+clusters_all <- c('all',clusters)
+q = 0.05
+## Evaluate influence on the 5th and 15th percentile of lowest BMD of clusters using leave-one-out
+  if(!usesavedoutputs){
+sa_c_linear_pool <- do.call('rbind',lapply(1:length(clusters_all),function(clid){
+objective1 <- function(d){(get_p_with_pool(d,loo=clusters_all[clid])$lower-q)^2}
+
+objective2 <- function(d){(get_p_with_pool(d,loo=clusters_all[clid])$upper-q)^2}
+
+df_opt <- data.frame(lower = optimize(objective1,interval = c(-10,10))$minimum,
+upper = optimize(objective2,interval = c(-10,10))$minimum,cdf = q,mind = min(df_env_all$dose),cluster = clusters_all[clid])
+}))
+save(sa_c_linear_pool,file=paste0("sa_c_linear_pool_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+  }else{
+load(file=paste0("sa_c_linear_pool_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+  }
+  
+ggplot(sa_c_linear_pool,aes(y=cluster,x=lower,fill=cluster))+
+# geom_point() + 
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=cluster))+
+ # xlim(-2,-1) + 
+#  facet_wrap(~iter) +
+  theme_bw()+
+    ylab("Cluster omitted") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name=paste0(100*q,"th percentile for estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)"), breaks=breaks, labels=10^breaks,limits = c(-2,1)) 
+
+```
+
+
+```{r sa_linearpool_15th, fig.width = 6, fig.height = 3}
+clusters_all <- c('all',clusters)
+q = 0.15
+## Evaluate influence on the 5th and 15th percentile of lowest BMD of clusters using leave-one-out
+  if(!usesavedoutputs){
+sa_c_linear_pool <- do.call('rbind',lapply(1:length(clusters_all),function(clid){
+objective1 <- function(d){(get_p_with_pool(d,loo=clusters_all[clid])$lower-q)^2}
+
+objective2 <- function(d){(get_p_with_pool(d,loo=clusters_all[clid])$upper-q)^2}
+
+df_opt <- data.frame(lower = optimize(objective1,interval = c(-10,10))$minimum,
+upper = optimize(objective2,interval = c(-10,10))$minimum,cdf = q,mind = min(df_env_all$dose),cluster = clusters_all[clid])
+}))
+save(sa_c_linear_pool,file=paste0("sa_c_linear_pool_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+  }else{
+load(file=paste0("sa_c_linear_pool_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+  }
+  
+ggplot(sa_c_linear_pool,aes(y=cluster,x=lower,fill=cluster))+
+# geom_point() + 
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=cluster))+
+ # xlim(-2,-1) + 
+#  facet_wrap(~iter) +
+  theme_bw()+
+    ylab("Cluster omitted") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name=paste0(100*q,"th percentile for estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)"), breaks=breaks, labels=10^breaks,limits = c(-2,1)) 
+
+```
+
+```{r sa_linearpool_5th_withoutALI, fig.width = 6, fig.height = 3}
+## Without ALI
+clusters_all <- c('all',clusters[-clid_remove])
+q <- 0.05
+## Evaluate influence on the 5th and 15th percentile of lowest BMD of clusters using leave-one-out
+if(!usesavedoutputs){
+sa_c_linear_pool <- do.call('rbind',lapply(1:length(clusters_all),function(clid){
+objective1 <- function(d){(get_p_with_pool(d,loo=c(clusters_all[clid],clusters[clid_remove]))$lower-q)^2}
+
+objective2 <- function(d){(get_p_with_pool(d,loo=c(clusters_all[clid],clusters[clid_remove]))$upper-q)^2}
+
+df_opt <- data.frame(lower = optimize(objective1,interval = c(-10,10))$minimum,
+upper = optimize(objective2,interval = c(-10,10))$minimum,cdf = q,mind = min(df_env_all$dose),cluster = clusters_all[clid])
+}))
+
+save(sa_c_linear_pool,file=paste0("sa_c_linear_pool_withoutALI_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+load(file=paste0("sa_c_linear_pool_withoutALI_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+  
+ggplot(sa_c_linear_pool,aes(y=cluster,x=lower,fill=cluster))+
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=cluster))+
+  theme_bw()+
+    ylab("Cluster omitted") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name=paste0(100*q,"th percentile for estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)"), breaks=breaks, labels=10^breaks,limits = c(-2,1)) 
+
+```
+
+```{r sa_linearpool_15th_withoutALI, fig.width = 6, fig.height = 3}
+## Without ALI
+clusters_all <- c('all',clusters[-clid_remove])
+q <- 0.15
+## Evaluate influence on the 5th and 15th percentile of lowest BMD of clusters using leave-one-out
+if(!usesavedoutputs){
+sa_c_linear_pool <- do.call('rbind',lapply(1:length(clusters_all),function(clid){
+objective1 <- function(d){(get_p_with_pool(d,loo=c(clusters_all[clid],clusters[clid_remove]))$lower-q)^2}
+
+objective2 <- function(d){(get_p_with_pool(d,loo=c(clusters_all[clid],clusters[clid_remove]))$upper-q)^2}
+
+df_opt <- data.frame(lower = optimize(objective1,interval = c(-10,10))$minimum,
+upper = optimize(objective2,interval = c(-10,10))$minimum,cdf = q,mind = min(df_env_all$dose),cluster = clusters_all[clid])
+}))
+
+save(sa_c_linear_pool,file=paste0("sa_c_linear_pool_withoutALI_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+load(file=paste0("sa_c_linear_pool_withoutALI_",q,"_",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+  
+ggplot(sa_c_linear_pool,aes(y=cluster,x=lower,fill=cluster))+
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=cluster))+
+  theme_bw()+
+    ylab("Cluster omitted") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name=paste0(100*q,"th percentile for estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)"), breaks=breaks, labels=10^breaks,limits = c(-2,1)) 
+
+
+```
+
+# Different experts on ALI 
+
+```{r}
+## show all experts without different colours
+if(FALSE){
+  ggplot(data=do.call('rbind',df_pool_expert),aes(x=dose,y=linear_pool_lower_cdf,fill = expert)) +
+  geom_line(alpha=0.4)+
+  geom_line(aes(x=dose,y=linear_pool_upper_cdf),colour = 'darkred',alpha = 0.4)+
+  #geom_line(data=env_exp_ALI[[1]],aes(x=dose+3,y=upper_cdf),colour = 'blue') +
+  #geom_line(data=env_exp_ALI[[1]],aes(x=dose+3,y=lower_cdf),colour = 'blue') +
+  theme_bw()+
+ # facet_wrap(~Q2) + 
+  ggtitle("Uncertainty in lowest BMD across clusters",
+          subtitle = paste("linear pools for one expert on ALI at a time")) +
+  ylab("cumulative probability") +
+  scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", 
+                     breaks=breaks, labels=10^(breaks),limits = NULL)
+}
+```
+
+
+# Sensitivity analysis - consider possible dependencies between clusters 
+
+
+```{r}
+
+if(SADEP){
+get_p_with_dependencies <- function(one_dose,loo='none',dep,rho){
+
+p_c <- get_linear_pool(info_hocs[[1]][!(info_hocs[[1]]$cluster %in% loo),],one_dose,pfunctions_hocs[[1]])
+p_i <- get_linear_pool(info_hocs[[2]][!(info_hocs[[2]]$cluster %in% loo),],one_dose,pfunctions_hocs[[2]])
+p_m <- get_linear_pool(info_hocs[[3]][!(info_hocs[[3]]$cluster %in% loo),],one_dose,pfunctions_hocs[[3]])
+p_n <- get_linear_pool(info_hocs[[4]][!(info_hocs[[4]]$cluster %in% loo),],one_dose,pfunctions_hocs[[4]])
+p_r <- get_linear_pool(info_hocs[[5]][!(info_hocs[[5]]$cluster %in% loo),],one_dose,pfunctions_hocs[[5]])
+
+# turn probabilities to 1 or zero where there are dependencies 
+rbind(p_c[p_c$cluster %in% dep,1:2],
+p_i[p_i$cluster %in% dep,1:2],
+p_m[p_m$cluster %in% dep,1:2],
+p_n[p_n$cluster %in% dep,1:2],
+p_r[p_r$cluster %in% dep,1:2])
+
+p_c[p_c$cluster %in% dep,1:2] = 0
+p_i[p_i$cluster %in% dep,1:2] = 0
+p_m[p_m$cluster %in% dep,1:2] = 0
+p_n[p_n$cluster %in% dep,1:2] = 0
+p_r[p_r$cluster %in% dep,1:2] = 0
+
+
+# derive joint probability for dependent clusters 
+i=as.numeric(cut(which(dep[1]==clusters),c(0,4,9,15,18,21)))
+clid_i=which(unlist(lapply(list_env_hocs[[i]],function(ee){ee$cluster[1]})) %in% dep[1])
+j=as.numeric(cut(which(dep[2]==clusters),c(0,4,9,15,18,21)))
+clid_j=which(unlist(lapply(list_env_hocs[[j]],function(ee){ee$cluster[1]})) %in% dep[2])
+
+ddd <-  list_env_hocs[[i]][[clid_i]]$dose
+pfunction_1 <- do.call('rbind',lapply(1:length(ddd),function(di){get_linear_pool(info_hocs[[i]][(info_hocs[[i]]$cluster %in% dep[1]),],ddd[di],pfunctions_hocs[[i]])}))
+
+ddd <-  list_env_hocs[[j]][[clid_j]]$dose
+pfunction_2 <- do.call('rbind',lapply(1:length(ddd),function(di){get_linear_pool(info_hocs[[j]][(info_hocs[[j]]$cluster %in% dep[2]),],ddd[di],pfunctions_hocs[[j]])}))
+
+jointprob = approx_jointprobability_linear_pool(target_d=one_dose,rho=rho,pfunction_1=pfunction_1,pfunction_2=pfunction_2,niter=15000)$probisd
+
+return(list(lower=1 - prod(1-p_c$lower_cdf)*
+prod(1-p_i$lower_cdf)*
+prod(1-p_m$lower_cdf)*
+prod(1-p_n$lower_cdf)*
+prod(1-p_r$lower_cdf)*
+  (max(jointprob)),
+upper = 1 - prod(1-p_c$upper_cdf)*
+prod(1-p_i$upper_cdf)*
+prod(1-p_m$upper_cdf)*
+prod(1-p_n$upper_cdf)*
+prod(1-p_r$upper_cdf)*
+  (min(jointprob))))
+}
+}
+```
+
+## Derive the envelope of the probability of at least one considering dependency between Allergic Lung Inflammation and Male and Female Reprotoxicity respectively
+
+```{r}
+if(SADEP){
+temp <- range(df_pool_all$dose[df_pool_all$linear_pool_upper_cdf>0.01 & df_pool_all$linear_pool_lower_cdf<0.99])
+dose_2 <- seq(temp[1],temp[2],length.out = 100)
+get_dep <- function(clid_deps,rhos){
+do.call('rbind',lapply(1:length(rhos),function(rid){
+lowup_all_dep <- lapply(1:length(dose_2),function(di){get_p_with_dependencies(one_dose=dose_2[di],loo='none',dep =clusters[clid_deps],rho=rhos[rid])})
+
+data.frame(lower_cdf=unlist(lapply(lowup_all_dep,function(x){x$lower})),upper_cdf=unlist(lapply(lowup_all_dep,function(x){x$upper})),dose = dose_2,rho = rhos[rid])
+}
+))
+}
+}
+```
+
+Male 
+
+```{r dep_ALI_male_linearpool}
+if(SADEP){
+if(!usesavedoutputs){
+df_dep <- get_dep(clid_deps=c(1,16),rhos = c(-0.9,0,0.5,0.9))
+df_dep$correlation = as.character(df_dep$rho)
+
+save(df_dep,file=paste0("df_dep_male",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+  load(paste0("df_dep_male",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+ggplot(data=df_dep,aes(x=dose,y=100*lower_cdf,color = correlation)) +
+  geom_line()+
+  geom_line(aes(x=dose,y=100*upper_cdf,color = correlation))+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_lower_cdf),col="black",alpha=0.7)+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_upper_cdf),col="black",alpha=0.7)+
+theme_bw()+
+  theme(legend.position="bottom",legend.title = element_text(size=8),
+      legend.text = element_text(size=7)) +
+ theme(plot.title = element_text(size = 8)) +
+  ggtitle("Dependence between Allergic Lung Inflammation \n and Male reprotoxicity") +
+  ylab("Cumulative probability (%)") +
+  scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = limits)
+
+}
+
+```
+
+```{r dep_ALI_female_linearpool}
+
+if(SADEP){
+if(!usesavedoutputs){
+   df_dep <- get_dep(clid_deps=c(1,17),rhos = c(-0.9,0,0.5,0.9))
+df_dep$correlation = as.character(df_dep$rho)
+save(df_dep,file=paste0("df_dep_female",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+  load(paste0("df_dep_female",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+
+ggplot(data=df_dep,aes(x=dose,y=100*lower_cdf,color = correlation)) +
+  geom_line()+
+  geom_line(aes(x=dose,y=100*upper_cdf,color = correlation))+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_lower_cdf),col="black",alpha=0.7)+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_upper_cdf),col="black",alpha=0.7)+
+theme_bw()+
+ theme(legend.position="bottom",legend.title = element_text(size=8),
+      legend.text = element_text(size=7)) +
+    theme(plot.title = element_text(size = 8)) +
+  ggtitle("Dependence between Allergic Lung Inflammation \n and Female reprotoxicity") +
+  ylab("Cumulative probability (%)") +
+  scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = limits)
+
+}
+
+```
+
+```{r dep_male_female_linearpool}
+
+if(SADEP){
+if(!usesavedoutputs){
+df_dep <- get_dep(clid_deps=c(16,17),rhos = c(-0.9,0,0.5,0.9))
+df_dep$correlation = as.character(df_dep$rho)
+
+save(df_dep,file=paste0("df_dep_malefemale",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}else{
+  load(paste0("df_dep_malefemale",Q1_ALI[1],"_",Q1_ALI[2],".Rdata"))
+}
+ggplot(data=df_dep,aes(x=dose,y=100*lower_cdf,color = correlation)) +
+  geom_line()+
+  geom_line(aes(x=dose,y=100*upper_cdf,color = correlation))+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_lower_cdf),col="black",alpha=0.7)+
+geom_line(data=df_pool_all,aes(x=dose,y=100*linear_pool_upper_cdf),col="black",alpha=0.7)+
+theme_bw()+
+  theme(legend.position="bottom",legend.title = element_text(size=8),
+      legend.text = element_text(size=7)) +
+   theme(plot.title = element_text(size = 8)) +
+  ggtitle("Dependence between Male and \n Female reprotoxicity") +
+  ylab("Cumulative probability (%)") +
+  scale_x_continuous(name="Estimated lowest BMD across all clusters \n (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = limits)
+
+
+}
+
+```
+
+
+```{r}
+if(FALSE){
+## show overlap of expert ALI results
+ggplot(data=do.call('rbind',df_pool_expert)) +
+  geom_ribbon(aes(x=dose,ymin=linear_pool_lower_cdf,ymax=linear_pool_upper_cdf,fill=expert,color=expert),alpha = 0.1) + 
+geom_line(data=df_env_all,aes(x=dose,y=lower_cdf),col="black",size = 1)+
+geom_line(data=df_env_all,aes(x=dose,y=upper_cdf),col="black",size = 1)+
+geom_line(data=df_pool_all,aes(x=dose,y=linear_pool_lower_cdf),col="red",linetype='dashed',size=1)+
+geom_line(data=df_pool_all,aes(x=dose,y=linear_pool_upper_cdf),col="red",linetype='dashed',size=1)+
+  theme_bw()+
+  #scale_fill_brewer(type="qual")+
+  ggtitle("Uncertainty in lowest BMD across clusters",subtitle = "black: envelope considering differences between experts, \n red: linear pool, coloured: linear pool per expert for ALI") +
+  ylab("cumulative probability") +
+scale_x_continuous(name="Lowest BMD across all clusters (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = c(-2.5,3))# +
+  #ylim(c(0,0.3))
+ggsave(paste("perALIover_",Q1_ALI[1],"_",Q1_ALI[2],".png"),width = 7, height = 6)
+}
+```
+
+```{r}
+#show linear pool for different experts ALI
+if(FALSE){
+ggplot(data=do.call('rbind',df_pool_expert)) +
+  geom_ribbon(aes(x=dose,ymin=linear_pool_lower_cdf,ymax=linear_pool_upper_cdf,fill=expert,color=expert),alpha = 0.5) + 
+geom_line(data=df_env_all[,colnames(df_env_all)!="expert"],aes(x=dose,y=lower_cdf),col="black",size = 1)+
+geom_line(data=df_env_all[,colnames(df_env_all)!="expert"],aes(x=dose,y=upper_cdf),col="black",size = 1)+
+geom_line(data=df_pool_all,aes(x=dose,y=linear_pool_lower_cdf),col="red",linetype='dashed',size=1)+
+geom_line(data=df_pool_all,aes(x=dose,y=linear_pool_upper_cdf),col="red",linetype='dashed',size=1)+
+  theme_bw()+
+  facet_wrap(~expert) +
+ #scale_fill_brewer(type="qual")+
+  ggtitle("Uncertainty in lowest BMD across clusters",subtitle = "black: envelope considering differences between experts, \n red: linear pool, coloured: linear pool per expert for ALI") +
+  ylab("cumulative probability") +
+scale_x_continuous(name="Lowest BMD across all clusters (HED, ng BPA/kg bw per day)", breaks=breaks, labels=10^breaks,limits = c(-2.5,3))# +
+  #ylim(c(0,0.3))
+ggsave(paste("perALIfacet_",Q1_ALI[1],"_",Q1_ALI[2],".png"),width = 10, height = 10)
+}
+```
+
+```{r}
+## plot intervals for 5th percentile with overlay linear pool
+if(FALSE){
+dfp <- df_calc_multi[df_calc_multi$perc == 0.05 & df_calc_multi$expert!="all",]
+dfpall <- df_calc_multi[df_calc_multi$perc == 0.05 & df_calc_multi$expert=="all",]
+dfp$expert = factor(dfp$expert,levels = c(LETTERS[1:14]))
+dfp$expert = factor(dfp$expert,levels=rev(levels(dfp$expert)))
+ggplot(dfp,aes(y=expert,x=lower,fill=expert))+
+  geom_errorbarh(aes(xmin = lower,xmax = upper,col=expert))+
+  geom_vline(xintercept=dfpall$lower,col='red',alpha = 0.5) +
+  geom_vline(xintercept=dfpall$upper,col='red',alpha = 0.5) +
+  theme_bw()+
+  ylab("expert") +
+  theme(legend.position = "none") +
+  scale_x_continuous(name="Lowest BMD across all clusters  (HED, ng BPA/kg bw per day)", breaks=c(-2,-1,0,1), labels=10^c(-2,-1,0,1),limits = c(-2,1)) +
+  ggtitle("Linear pool of 5th percentile", subtitle="all experts (red)")
+ggsave(paste("5perclinearpool_v2_",Q1_ALI[1],"_",Q1_ALI[2],".png"),width = 7, height = 6)
+}
+```
+
+
+```{r}
+#plot density curves of the experts per ALI
+if(FALSE){
+df_sel <-  do.call('rbind',lapply(1:14,function(jj){
+    
+    dat <- df_per_expert[[jj]]
+    x = dat$dose
+    cdf = dat$lower_cdf
+    sam_lower = approx(cdf,x,runif(2*10^4),rule=2,ties=mean)$y
+    cdf = dat$upper_cdf
+    sam_upper = approx(cdf,x,runif(2*10^4),rule=2,ties=mean)$y
+    data.frame(xl=sam_lower,xu=sam_upper,expert = LETTERS[jj])
+  }))
+
+ggplot(df_sel, aes(x = xl, group = expert)) + 
+  geom_density(colour = "black",alpha = 0.4) +
+  geom_density(aes(x = xu),colour = 'darkred',alpha = 0.4) +
+  theme_bw()+
+  ggtitle("Uncertainty in lowest BMD across clusters",
+          subtitle = "Densities per expert for ALI") +
+  ylab("probability density") +
+  scale_x_continuous(name="Lowest BMD across all clusters (HED, ng BPA/kg bw per day)", 
+                     breaks=breaks, labels=10^(breaks),limits = NULL)
+ggsave(paste0("density_graphs_",Q1_ALI[1],"_",Q1_ALI[2],".png"),width = 7, height = 6)
+}
+```
+

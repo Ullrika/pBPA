@@ -1,0 +1,277 @@
+---
+title: "Probability function for clusters and experts in a health outcome category"
+author: "Ullrika Sahlin"
+date: "`r Sys.Date()`"
+params: 
+  hocs: c('immunotox','metabolic','neurotox','repro','carcino')
+  probmassoutside: 0.001
+  origALI: FALSE
+  hoc: 'immunotox'
+  fit_distributions: FALSE
+  Q1_ALI: c(66,66)
+  figdir: figures
+output:
+  html_document:
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+hocs <- params$hocs
+probmassoutside <- params$probmassoutside
+origALI <- params$origALI
+hoc <- params$hoc
+fit_distributions <- params$fit_distributions
+Q1_ALI = params$Q1_ALI
+
+knitr::opts_chunk$set(dev = c('png','pdf'),
+                      fig.width=6,fig.height=4,fig.path = params$figdir)
+```
+
+```{r libraries, include = FALSE}
+library('dplyr')
+library('openxlsx')
+library('fitdistrplus')
+library('SHELF') # modified version
+library('ggplot2')
+library('sn')
+
+#theme_set(theme_bw(base_size = 12)) 
+
+source('functions_BPA.R')
+```
+
+# Select data file   
+```{r}
+if(hoc == 'carcino'){
+expert_xlsx = c(paste0("clusterdata/","BPA uncertainty analysis CARCINO - expert A.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis CARCINO - expert B_ullrika.xlsm"))
+}
+
+if(hoc == 'immunotox'){
+  if(origALI){
+expert_xlsx = c(paste0("clusterdata/","BPA uncertainty analysis IMMUNOTOX expert A v2.xlsm"),
+expert_xlsx = paste0("clusterdata/","BPA uncertainty analysis IMMUNOTOX expert B v2.xlsm"))
+     }else{
+expert_xlsx = c(paste0("clusterdata/","BPA uncertainty analysis IMMUNOTOX expert A v3_noALI.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis IMMUNOTOX expert B v3_noALI.xlsm"))
+expertJuly12th_xlsx = paste0("clusterdata/","CREATE roulette CSV file v2 - WITH REVISED JUDGEMENTS FROM EXPERT N.xlsx")
+}
+}
+
+if(hoc == 'metabolic'){
+expert_xlsx = c(paste0("clusterdata/","BPA uncertainty analysis METABOLIC - expert A.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis METABOLIC - expert B.xlsm"))
+}
+
+if(hoc == 'neurotox'){
+expert_xlsx = c(paste0("clusterdata/","BPA uncertainty analysis NEUROTOX - expert A.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis NEUROTOX - expert B.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis NEUROTOX - expert C.xlsm"))
+}
+
+if(hoc == 'repro'){
+expert_xlsx = c(paste0("clusterdata/","BPA uncertainty analysis REPRO - expert A.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis REPRO - expert B v2.xlsm"),
+paste0("clusterdata/","BPA uncertainty analysis REPRO - expert C v2.xlsm"))
+}
+
+sheet = "Summary data"
+
+```
+
+# Extract data and fit distribution to Q2 
+
+All doses are transformed into nano unit when extracting elicited data
+
+```{r fit}
+if(fit_distributions){
+df_group <- lapply(1:length(expert_xlsx),function(expert){
+  ## Cluster
+cluster_nams <- read.xlsx(xlsxFile=expert_xlsx[expert],sheet= sheet, rows = 2, cols = 2:10,colNames = FALSE)
+cluster_ids <- grep("START HERE",cluster_nams,invert=TRUE)
+cluster_nams <- as.character(cluster_nams[grep("START HERE",cluster_nams,invert=TRUE)])
+if(length(cluster_nams)>0){
+df_cluster <- lapply(1:length(cluster_nams),function(clid){
+  ## Q1 and Q2
+df <- do.one.data.extration(expert,cluster_ids[clid])## transformation to nano scale
+df$cluster = cluster_nams[clid]
+df$fit <- do.one.fit(df,fit.mixture = TRUE)  
+return(df)
+})
+names(df_cluster) <- cluster_nams
+
+}else{df_cluster <- NA}
+return(df_cluster)
+})
+if(hoc != "immunotox" | origALI){
+save(df_group,file=paste('fit_',hoc,probmassoutside,'.Rdata'))
+}
+
+if(hoc == "immunotox" & !origALI){ # add the judgements from July 12
+df_noALI <-  df_group
+df_ALI <- lapply(1:14,function(expert){
+  df <- do.one.data.extration_12july(expert,Q1 = Q1_ALI/100)
+df$cluster = "Allergic lung inflammation "
+df$fit <- do.one.fit(df,fit.mixture = TRUE)
+df_cluster <- vector('list',1)
+df_cluster[[1]] <- df
+names(df_cluster) <- "Allergic lung inflammation "
+return(df_cluster)
+})
+
+df_group <- append(df_ALI,df_noALI)
+  save(df_group,file=paste('fit_revised',hoc,probmassoutside,'.Rdata'))
+  }
+}else{
+  if(hoc == "immunotox" & !origALI){
+load(file=paste('fit_revised',hoc,probmassoutside,'.Rdata'))
+  }else{
+load(file=paste('fit_',hoc,probmassoutside,'.Rdata'))
+}}
+```
+
+# Combine the answers to Q1 and Q2 into a probability function per cluster and expert
+
+Probability functions derived from Q1 and Q2 using parametric distributions or interpolation from the roulette histograms.
+
+```{r}
+# data frame for elicited data
+df.pq <- make_distr_dataframe(df_group) 
+
+pfunctions <- get_pfunctions(df_group) 
+pfunctions_histo <- get_pfunctions_histo(df_group)
+
+# info about the structure in the pfunctions 
+info <- do.call('rbind',lapply(1:length(pfunctions),function(i){
+  do.call('rbind',lapply(1:length(pfunctions[[i]]),function(j){data.frame(i=i,j=j,expert = pfunctions[[i]][[j]]$expert, cluster = pfunctions[[i]][[j]]$cluster)}))
+  }))
+```
+
+
+```{r clusters_experts, fig.width=6, fig.height = 5}
+# Plot lower and upper cdf for each cluster and expert
+plot_clusters(df.pq)
+```
+
+
+```{r clusters_oneexpert, fig.width = 6, fig.height = 3}
+# Plot lower and upper cdf for one cluster and one expert
+if(hoc == "immunotox"){
+plot_clusters_oneexpert(df.pq,experttoplot = 2)
+}
+```
+
+# Aggregate over experts into an envelope considering differences between experts  
+
+```{r}
+dose_curve = seq(-4,4,length.out = 300)
+
+df_env <- get_env(info,dose_curve,pfunctions)
+df_env$type = 'parametric'
+
+df_env_histo <- get_env(info,dose_curve,pfunctions_histo)
+df_env_histo$type = 'histogram'
+
+list_env <- get_env_list(info,dose_curve,pfunctions)  # the list version is used in some functions
+```
+
+
+```{r}
+# Plot parametric distributions comparing experts 
+eids = unique(info$expert)
+unc_expert <- lapply(1:length(eids),function(eid){
+  temp <- get_env(info[info$expert==eids[eid],],dose_curve,pfunctions)
+  temp$expert = eids[eid]
+  return(temp)
+})
+df.pq_range <- do.call('rbind',unc_expert)
+df.pq_range$type = 'parametric'
+
+plot_experts(df.pq_range)
+
+```
+
+
+```{r}
+## Plot interpolation between histograms comparing experts 
+if(FALSE){
+unc_expert_histo <- lapply(1:length(eids),function(eid){
+  temp <- get_env(info[info$expert==eids[eid],],dose_curve,pfunctions_histo)
+  temp$expert = eids[eid]
+  return(temp)
+})
+
+df.pq_range_histo <- do.call('rbind',unc_expert_histo)
+df.pq_range_histo$type = 'histogram' 
+
+plot_experts(df.pq_range_histo)
+}
+```
+
+
+
+```{r}
+## Plot envelope comparing parametric and histogram 
+if(FALSE){
+ggplot(data=rbind(df_env,df_env_histo),aes(x=dose,y=100*lower_cdf,linetype=type)) +
+  geom_line()+
+  geom_line(aes(x=dose,y=100*upper_cdf))+
+theme_bw()+
+  scale_x_continuous(name="Lowest BMD in the cluster (HED, ng BPA/kg bw per day)", breaks=c(-4,-2,0,2), labels=10^c(-4,-2,0,2),limits = c(-4,4)) + 
+  #ggtitle("Envelope of uncertainty distributions") +
+  ylab("cumulative probability") +
+  ylim(0,100) +
+  facet_wrap(~cluster,scale = "free")
+}
+```
+
+
+```{r}
+# Plot parametric distributions and corresponding envelope in the same graph for each cluster 
+if(FALSE){
+  plot_experts_with_env(df.pq_range,df_env)
+} 
+```
+
+```{r, onecluster_oneexpert_env, fig.width = 5, fig.height = 3}
+if(hoc == "immunotox"){
+#cls <- unique(df_env$cluster)
+#for(clid in 1:length(cls)){
+clid = 1
+plot_experts_with_env_onecluster(df.pq_range,df_env,clid=clid)
+#}
+}
+```
+
+
+```{r}
+# Plot histograms and corresponding envelope in the same graph for each cluster 
+#plot_experts_with_env(df.pq_range_histo,df_env_histo)
+```
+
+
+```{r}
+# Plot envelope and linear pool of upper and lower bounds 
+
+#plot_experts_with_env_linear_pool(df.pq_range_histo,df_env_histo)
+```
+
+```{r ALI_judgements, fig.width = 6, fig.height = 4}
+if(hoc == "immunotox" & !origALI){
+df_ALI <- do.call('rbind',lapply(1:length(df_group),function(expert){
+  df_group[[expert]]$`Allergic lung inflammation `$fit$df_fit 
+ }))
+
+df_ALI$expertnr = df_ALI$expert
+df_ALI$expert = LETTERS[df_ALI$expertnr]
+xa_ALI = c(-2,0,2,4)  
+
+ggplot(df_ALI,aes(x=log10dd,y=pdf,col=expert)) + 
+  geom_line() + 
+    ylab('Probability density') +
+    ggtitle('Allergic lung inflammation') +
+    scale_x_continuous(name="Estimated lowest BMD in this cluster \n (HED, ng BPA/kg bw per day)", breaks=xa_ALI, labels=10^xa_ALI) +
+  theme(legend.position = "none")
+}
+```
