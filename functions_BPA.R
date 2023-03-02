@@ -1,19 +1,16 @@
-########################################################
-### Code for probabilistic uncertainty analysis 
-### to support BPA Opinion 2021
-### Prepared by Ullrika Sahlin, Lund University
-### based on instructions from Andy Hart 
-########################################################
 
 nano.unit = "ng/kg.bw/day"
 mikro.unit = "μg/kg.bw/day"
 milli.unit = "mg/kg.bw/day"
 
+#load("fit_distributions.Rdata")
+
 do.one.data.extration <- function(expert,clid){
 reason <- NULL
 reason$Q1 <- read.xlsx(xlsxFile=expert_xlsx[expert],sheet= sheet, rows = 3, cols = clid+1, colNames = FALSE)$X1
 
-if(read.xlsx(xlsxFile=expert_xlsx[expert],sheet = sheet, rows = 13, cols = clid+1, colNames = FALSE)$X1){
+if(read.xlsx(xlsxFile=expert_xlsx[expert],sheet = sheet, rows = 13, 
+             cols = clid+1, colNames = FALSE)$X1){
   Q1 <- read.xlsx(xlsxFile=expert_xlsx[expert],sheet= sheet, rows = 14:15, cols = clid+1, colNames = FALSE)$X1/100
   Q1 <- range(Q1) #just in case they happen to be the other way around
 }else{
@@ -131,7 +128,9 @@ do.one.data.extration_12july <- function(expert,Q1){
   return(list(Q1=Q1,Q2=Q2,reason=reason,unit=unit,expert = expert,clid = clid))
 }
 
+
 do.one.fit = function(df,fit.mixture=FALSE,adj=TRUE){
+
   ## select if we are to adjust for probability outside bins or not
   # no adjustment
   if(!adj){
@@ -143,17 +142,21 @@ do.one.fit = function(df,fit.mixture=FALSE,adj=TRUE){
     df$Q2$cdf <- df$Q2$cdf_adj
     df$Q2$p <- df$Q2$p_adj
   }
-
   
   ## Fit a distribution to data the logged (base 10) scale. 
   fit_log10 <- SHELF::fitdist(vals = df$Q2$log10d, 
                               probs = df$Q2$cdf, 
                               lower = min(df$Q2$log10d)-1e-6, 
                               upper = max(df$Q2$log10d)+1e-6)
+  
+  
   fit_log10$ssq <- fit_log10$ssq[c(1,2,3,4,5,11)]
   
   ## metrics to re-evaluate best fit
   fit_log10$num_param = c(2,3,3,4,5,2)
+  fit_log10$R2 = 1-fit_log10$ssq/sum(df$Q2$cdf^2) 
+  ## adjR2 are giving very similar values (close to 99%)
+  fit_log10$adjR2 = 1-(1-fit_log10$R2)*(length(df$Q2$cdf)-1)/(length(df$Q2$cdf)-fit_log10$num_param-1)
   
   ## Derive goodness of fit based on linear approximation of cdf
   {
@@ -210,10 +213,19 @@ do.one.fit = function(df,fit.mixture=FALSE,adj=TRUE){
   }
   
   
+  ## three different options for goodness of fit. Here we use ssq based on 20 interpolated points, which penalises overfit of mixtures  
+  #temp <- -fit_log10$ssq
+  #temp <- round(fit_log10$adjR2,3)
   temp <- -fit_log10$ssq_approx
+  #temp <- round(fit_log10$adjR2_approx,3)
   temp[(length(df$Q2$cdf)-fit_log10$num_param-1)<1] = 10^3 #remove distributions with more than data-1 number of parameters
-  fit_log10$best.fitting$best.fit <- names(fit_log10$ssq)[min(which(temp == max(temp)))] #use min to select the most parsimonius in presence of mixtures   
-  
+  fit_log10$best.fitting$best.fit <- names(fit_log10$ssq)[min(which(temp == max(temp)))] #use min to select the most parsimonious in presence of mixtures   
+  if(!fit.mixture){
+    nam_no_mix <- names(fit_log10$ssq)
+    temp_no_mix <- temp[which(nam_no_mix != "normal_mix")]
+    nam_no_mix <- nam_no_mix[which(nam_no_mix != "normal_mix")]
+    fit_log10$best.fitting$best.fit <- nam_no_mix[min(which(temp_no_mix == max(temp_no_mix)))] #use min to select the most parsimonious in presence of mixtures   
+  }
   ## Plot CDF of the best fit 
   {
     plotcdf = FALSE
@@ -346,10 +358,11 @@ do.one.fit = function(df,fit.mixture=FALSE,adj=TRUE){
     if(fit_log10$best.fitting$best.fit == "beta"){
       leg = "beta distribution"
     }
+    {
     density.pairs <- NULL
     difflog10d <- c(0,df$Q2$log10d[-1] - df$Q2$log10d[-length(df$Q2$d)]) 
     temp <- df$Q2$p[-1]/difflog10d[-1]#/.5
-    xlabels = seq(fit_log10$limits$lower,fit_log10$limits$upper,length.out = 5)
+    xlabels = seq(ceiling(min(fit_log10$limits$lower)),floor(max(fit_log10$limits$upper)),by = 1)
     ylabels = seq(0,max(temp)*1.3,length.out = 6)
     density.pairs$h  <- c(0,temp[rep(1:length(temp),each=2)],0)
     density.pairs$d <- rep(df$Q2$d,each=2)
@@ -359,8 +372,9 @@ do.one.fit = function(df,fit.mixture=FALSE,adj=TRUE){
          ylim = range(ylabels),
          xlab= "Estimated lowest BMD in this cluster \n (HED, ng BPA/kg bw per day)", 
          ylab = 'Probability density',
-         main = paste0(df$cluster, "expert ",LETTERS[df$expert]), xaxt = "n")
-    axis(side = 1, at = rr_breaks, labels = round(10^rr_breaks,2))
+         main = paste0(df$cluster, " expert ",LETTERS[df$expert]), xaxt = "n")
+    axis(side = 1, at = xlabels, labels = round(10^xlabels,3))#round(10^rr_breaks,2))
+    }
     legend('topright',c(leg,"roulette histogram"),col = c('blue','black'),
            lty = c(1,1), bty='n')
     
@@ -469,6 +483,14 @@ make_distr_dataframe <- function(df_group){
    df.pq <- do.call('rbind',lapply(1:length(df_group),function(expert){
     pq <- lapply(1:length(df_group[[expert]]),function(clid){
       df <- df_group[[expert]][[clid]]
+      ## transform to have unit nano.unit
+      #if(df$unit == nano.unit){
+      #  log10x = df$fit$df_fit$log10dd  
+      #}else if(df$unit == milli.unit){
+      #  log10x = df$fit$df_fit$log10dd+6
+      #}else{
+      #  log10x = df$fit$df_fit$log10dd+3
+      #}
       log10x = df$fit$df_fit$log10dd
      
       cdf_lower = df$Q1[1]*df$fit$df_fit$cdf
@@ -509,24 +531,25 @@ plot_clusters <- function(df.pq){
     ylab('Cumulative probability (%)') +
     ylim(0,100) +
       scale_x_continuous(name="Estimed lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
-      breaks=xa, labels=10^xa,limits = range(xa)) 
+      breaks=xa, labels=10^xa,limits = NULL)#range(xa)) 
+  #xlim(-2,1)
 }
 
 plot_clusters_oneexpert <- function(df.pq,experttoplot){
   df.pqexpert <- df.pq %>%
     filter(expert == paste("expert",LETTERS[experttoplot]))
   
-  xa = seq(min(unique(round(df.pq$log10d,0)))-1,
-           max(unique(round(df.pq$log10d,0)))+1,by=2)
+  xa = seq(-3,5,by=2)#seq(min(unique(round(df.pq$log10d,0)))-1,
+           #max(unique(round(df.pq$log10d,0)))+1,by=2)
   cls = unique(df.pqexpert$cluster)
   df.ext = do.call('rbind',lapply(1:length(cls),function(clid){
-    temp <-   df.pqexpert[df.pqexpert$cluster==cls[clid],]
+    temp <- df.pqexpert[df.pqexpert$cluster==cls[clid],]
     agg <- aggregate(temp$log10d,by=list(expert=temp$expert),'max')
     cdf_lower <- aggregate(temp$cdf_lower,by=list(expert=temp$expert),'max')$x
     cdf_upper <- aggregate(temp$cdf_upper,by=list(expert=temp$expert),'max')$x
     data.frame(agg,cdf_lower,cdf_upper,cluster=cls[clid])
   }))
-  df.ext$xend = max(xa)
+  df.ext$xend = 6#max(xa)
    df.pqexpert %>%
     ggplot(aes(x=log10d,y=100*cdf_upper,col=cluster))+
     geom_line() +
@@ -538,7 +561,10 @@ plot_clusters_oneexpert <- function(df.pq,experttoplot){
     ylim(0,100) +
     ggtitle(paste("Expert",LETTERS[experttoplot])) + 
     scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
-                       breaks=xa, labels=10^xa,limits = range(xa)) 
+                       breaks=xa, labels=10^xa,limits = c(-3,6)) 
+  #xlim(-2,1)
+ #  ggsave(filename = paste("clusteroneexpert",origALI,".jpeg"))
+ #  ggsave(filename = paste("clusteroneexpert",origALI,".pdf"))
 }
 
 plot_experts <- function(df.pq){
@@ -561,7 +587,7 @@ plot_experts <- function(df.pq){
   df.ext$xend = max(xa)
   
   df.pq %>%
-    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,linetype=expert))+
+    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,group=expert))+#linetype=expert))+
     geom_line() +
     geom_line(aes(x=dose,y=100*lower_cdf,col=cluster))+
     geom_segment(data=df.ext,aes(x=x,xend=xend,y=100*upper_cdf,yend=100*upper_cdf))+
@@ -572,8 +598,10 @@ plot_experts <- function(df.pq){
     theme_bw()  +
     ylab('Cumulative probability (%)') +
     ylim(0,100) +
+    #ggtitle(tit) +
     scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
-                       breaks=xa, labels=10^xa,limits = range(xa)) #+
+                       breaks=xa, labels=10^xa,limits = NULL)#range(xa)) #+
+  #xlim(-2,1)
 }
 
 
@@ -597,17 +625,22 @@ plot_experts_with_env <- function(df.pq_range,df_env){
   
   
   df.ee %>%
-    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,linetype=expert))+
+    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,group = expert))+ #,linetype=expert))+
     geom_line() +
     geom_line(aes(x=dose,y=100*lower_cdf,col=cluster))+
+    #geom_segment(data=df.ext,aes(x=x,xend=xend,y=cdf_upper,yend=cdf_upper))+
+    #geom_segment(data=df.ext,aes(x=x,xend=xend,y=cdf_lower,yend=cdf_lower))+
+    #geom_line(aes(x=log10d,y=cdf_hist_lower),col='black',alpha=0.5)+
+    # geom_line(aes(x=log10d,y=cdf_hist_upper),col='black',alpha=0.5)+
     geom_line(data=df_env2,aes(x=dose,y=100*upper_cdf),col='black')+
     geom_line(data=df_env2,aes(x=dose,y=100*lower_cdf),col='black')+
     facet_wrap(~cluster, scales = 'free') +
     theme_bw()  +
     ylab('Cumulative probability (%)') +
     ylim(0,100) +
+    #ggtitle("Uncertainty distributions",subtitle = "with envelope across individual experts") +
     scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
-                       breaks=xa, labels=10^xa,limits = range(xa)) #+
+                       breaks=xa, labels=10^xa,limits = NULL)#range(xa)) #+
   
 }
 
@@ -617,7 +650,67 @@ plot_experts_with_env_onecluster <- function(df.pq_range,df_env,clid){
   df_env2$expert = "envelope"
   df.ee <- rbind(df.pq_range[,colnames(df_env2)],df_env2)
   
+  xa = c(-2,0,2,4)
+  cls = unique(df.ee$cluster)
+  #df.ext = do.call('rbind',lapply(1:length(cls),function(clid){
+  #  temp <-   df.pq_range[df.pq_range$cluster==cls[clid],]
+  #  agg <- aggregate(temp$dose,by=list(expert=temp$expert),'max')
+  #  lower_cdf <- aggregate(temp$lower_cdf,by=list(expert=temp$expert),'max')$x
+  #  upper_cdf <- aggregate(temp$upper_cdf,by=list(expert=temp$expert),'max')$x
+  #  data.frame(agg,lower_cdf,upper_cdf,cluster=cls[clid])
+  #}))
+  #df.ext$xend = max(xa)
+  
+  df_env2_clid <- df_env2 %>%
+    filter(cluster == cls[clid]) %>%
+    mutate(what = paste(cls[clid],"with envelope and average"))
+  
+  df.ee_clid <-  df.ee %>%
+    filter(cluster == cls[clid])
+  lp_lower_cdf <- aggregate(df.ee_clid$lower_cdf,by=list(dose=df.ee_clid$dose),'mean')$x
+  lp_upper_cdf <- aggregate(df.ee_clid$upper_cdf,by=list(dose=df.ee_clid$dose),'mean')$x
+  
+  df.ee_clid <- rbind(df.ee_clid,df.ee_clid)
+  df.ee_clid$what  <- rep(c(cls[clid],"with envelope and average"),each=nrow(df.ee_clid)/2) 
+  removerow <- df.ee_clid$what == cls[clid] & df.ee_clid$expert == "envelope"
+  df.ee_clid <- df.ee_clid[!removerow,]
+  
+  df.lp_clid  <- data.frame(lower_cdf=lp_lower_cdf,upper_cdf=lp_upper_cdf,dose=df.ee_clid$dose[df.ee_clid$expert== "envelope"],
+             cluster = df.ee_clid$cluster[1], type = df.ee_clid$type[1],expert = 'average',what = "with envelope and average")
+  
+  df_env2_clid$what = "with envelope and average"
+  df.ee_clid %>%
+    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,group = expert))+#linetype=expert))+
+    geom_line() +
+    geom_line(aes(x=dose,y=100*lower_cdf,col=cluster), linetype = "dashed") +
+    geom_line(data=df.lp_clid,aes(x=dose,y=100*lower_cdf,col=cluster), col='blue',size = 1) +
+    geom_line(data=df.lp_clid,aes(x=dose,y=100*upper_cdf,col=cluster), col='blue',size = 1) +
+    geom_line(data=df_env2_clid,aes(x=dose,y=100*upper_cdf),col='black',alpha = 0.5,size = 1)+
+    geom_line(data=df_env2_clid,aes(x=dose,y=100*lower_cdf),col='black',alpha = 0.5,size = 1)+
+    theme_bw()  +
+    ylab('Cumulative probability (%)') +
+    ylim(0,100) +
+    facet_wrap(~what) +
+    #ggtitle("Uncertainty distributions") +
+    scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
+                       breaks=xa, labels=10^xa)+#,limits = range(xa)) +
+    guides(color="none") #+ 
+   # theme(legend.position="bottom")
+ # ggsave(filename = paste("env_cluster",cls[clid],origALI,".jpeg"),width = 10, height = 6)
+  #ggsave(filename = paste("env_cluster",cls[clid],origALI,".pdf"),width = 10, height = 6)
+  
+  
+}
+
+plot_experts_with_env_onecluster_twopanes <- function(df.pq_range,df_env,clid){
+  df.pq_range$expert = paste('expert',LETTERS[df.pq_range$expert])
+  df_env2 <- df_env
+  df_env2$expert = "envelope"
+  df.ee <- rbind(df.pq_range[,colnames(df_env2)],df_env2)
+  
   xa = c(-2,0,2)
+  #xa = seq(min(unique(round(df.ee$dose,0))),
+  #         max(unique(round(df.ee$dose,0)))+1,by=2)
   cls = unique(df.ee$cluster)
   df.ext = do.call('rbind',lapply(1:length(cls),function(clid){
     temp <-   df.pq_range[df.pq_range$cluster==cls[clid],]
@@ -641,21 +734,67 @@ plot_experts_with_env_onecluster <- function(df.pq_range,df_env,clid){
   
   df_env2_clid$what = "with envelope"
   df.ee_clid %>%
-    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,linetype=expert))+
+    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster,group = expert))+#linetype=expert))+
     geom_line() +
-    geom_line(aes(x=dose,y=100*lower_cdf,col=cluster))+
+    geom_line(aes(x=dose,y=100*lower_cdf,col=cluster), linetype = "dashed") +
     geom_line(data=df_env2_clid,aes(x=dose,y=100*upper_cdf),col='black',alpha = 0.5)+
     geom_line(data=df_env2_clid,aes(x=dose,y=100*lower_cdf),col='black',alpha = 0.5)+
     theme_bw()  +
     ylab('Cumulative probability (%)') +
     ylim(0,100) +
     facet_wrap(~what) +
+    #ggtitle("Uncertainty distributions") +
     scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
                        breaks=xa, labels=10^xa)+#,limits = range(xa)) +
     guides(color="none") #+ 
-
+  # theme(legend.position="bottom")
+  # ggsave(filename = paste("env_cluster",cls[clid],origALI,".jpeg"),width = 10, height = 6)
+  #ggsave(filename = paste("env_cluster",cls[clid],origALI,".pdf"),width = 10, height = 6)
+  
+  
 }
 
+get_linear_pool_WRONG <- function(df.pq_range){
+  df.pq_range$expert = paste('expert',LETTERS[df.pq_range$expert])
+  
+  cls = unique(df.pq_range$cluster)
+  df.ee = do.call('rbind',lapply(1:length(cls),function(clid){
+    temp <-   df.pq_range[df.pq_range$cluster==cls[clid],]
+    agg <- aggregate(temp$dose,by=list(expert=temp$expert),'max')
+    lower_cdf <- aggregate(temp$lower_cdf,by=list(expert=temp$expert),'max')$x
+    upper_cdf <- aggregate(temp$upper_cdf,by=list(expert=temp$expert),'max')$x
+    data.frame(agg,lower_cdf,upper_cdf,cluster=cls[clid])
+  }))
+  
+  lower_agg = aggregate(df.ee$lower_cdf,by = list(dose=df.ee$dose,cluster=df.ee$cluster,
+                                                  type=df.ee$type),FUN = 'mean')
+  colnames(lower_agg)[4] <- "lower_cdf"
+  upper_agg = aggregate(df.ee$upper_cdf,by = list(dose=df.ee$dose,cluster=df.ee$cluster,
+                                                  type=df.ee$type),FUN = 'mean')
+  df.lp <- data.frame(lower_agg,upper_cdf = upper_agg$x,
+                      mid_cdf = (upper_agg$x+lower_agg$lower_cdf)/2)
+  
+  df.lp %>%
+    ggplot(aes(x=dose,y=100*upper_cdf,col=cluster))+
+    geom_line() +
+    geom_line(aes(x=dose,y=100*lower_cdf,col=cluster))+
+    #geom_line(aes(x=dose,y=mid_cdf),linetype = "dashed",col='black')+
+    #geom_segment(data=df.ext,aes(x=x,xend=xend,y=cdf_upper,yend=cdf_upper))+
+    #geom_segment(data=df.ext,aes(x=x,xend=xend,y=cdf_lower,yend=cdf_lower))+
+    #geom_line(aes(x=log10d,y=cdf_hist_lower),col='black',alpha=0.5)+
+    # geom_line(aes(x=log10d,y=cdf_hist_upper),col='black',alpha=0.5)+
+    geom_line(data=df_env2,aes(x=dose,y=100*upper_cdf),col='black')+
+    geom_line(data=df_env2,aes(x=dose,y=100*lower_cdf),col='black')+
+    facet_wrap(~cluster, scales = 'free') +
+    theme_bw()  +
+    ylab('Cumulative probability (%)') +
+    ylim(0,100) +
+    #ggtitle("Uncertainty distributions",subtitle = "with envelope and linear pool (lower, upper, mid)") +
+    scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
+                       breaks=xa, labels=10^xa,limits = range(xa)) #+
+  
+  
+}
 
 plot_experts_with_env_linear_pool <- function(df.pq_range,df_env){
   df.pq_range$expert = paste('expert',LETTERS[df.pq_range$expert])
@@ -687,12 +826,18 @@ plot_experts_with_env_linear_pool <- function(df.pq_range,df_env){
     ggplot(aes(x=dose,y=100*upper_cdf,col=cluster))+
     geom_line() +
     geom_line(aes(x=dose,y=100*lower_cdf,col=cluster))+
+    #geom_line(aes(x=dose,y=mid_cdf),linetype = "dashed",col='black')+
+    #geom_segment(data=df.ext,aes(x=x,xend=xend,y=cdf_upper,yend=cdf_upper))+
+    #geom_segment(data=df.ext,aes(x=x,xend=xend,y=cdf_lower,yend=cdf_lower))+
+    #geom_line(aes(x=log10d,y=cdf_hist_lower),col='black',alpha=0.5)+
+    # geom_line(aes(x=log10d,y=cdf_hist_upper),col='black',alpha=0.5)+
     geom_line(data=df_env2,aes(x=dose,y=100*upper_cdf),col='black')+
     geom_line(data=df_env2,aes(x=dose,y=100*lower_cdf),col='black')+
     facet_wrap(~cluster, scales = 'free') +
     theme_bw()  +
     ylab('Cumulative probability (%)') +
     ylim(0,100) +
+    #ggtitle("Uncertainty distributions",subtitle = "with envelope and linear pool (lower, upper, mid)") +
     scale_x_continuous(name="Estimated lowest BMD in the cluster \n (HED, ng BPA/kg bw per day)", 
                        breaks=xa, labels=10^xa,limits = range(xa)) #+
   
@@ -767,7 +912,7 @@ get_env <- function(info,dose_curve,pfunc,expert = 'all'){
   cls = unique((info$cluster))
   do.call('rbind',lapply(1:length(cls),function(k){
     what <- info[info$cluster==cls[k],]
-    if(cls[k]=="Allergic lung inflammation " & expert != 'all'){
+    if(cls[k]=="Allergic lung inflammation" & expert != 'all'){
       what <- what[what$expert==expert,]
     } 
     temp_cdf_env <- do.call('rbind',lapply(1:length(dose_curve),function(di){
@@ -785,7 +930,7 @@ get_env_list <- function(info,dose_curve,pfunc,expert = 'all'){
   cls = unique((info$cluster))
   lapply(1:length(cls),function(k){
     what <- info[info$cluster==cls[k],]
-    if(cls[k]=="Allergic lung inflammation " & expert != 'all'){
+    if(cls[k]=="Allergic lung inflammation" & expert != 'all'){
       what <- what[what$expert==expert,]
     } 
     temp_cdf_env <- do.call('rbind',lapply(1:length(dose_curve),function(di){
@@ -801,6 +946,11 @@ get_env_list <- function(info,dose_curve,pfunc,expert = 'all'){
 
 approx_jointprobability <- function(target_d,rho,i,j,clid_i,clid_j,niter, env_hocs){
 
+  # specify a correlation
+  #rho=0.9
+  # choose a dose
+  #d = -1
+  # make sure the range over which optimisation is done covers the target dose 
   maxd = max(list_env_hocs[[i]][[clid_i]]$dose,list_env_hocs[[j]][[clid_j]]$dose,target_d + 1)
   mind = min(list_env_hocs[[i]][[clid_i]]$dose,list_env_hocs[[j]][[clid_j]]$dose,target_d - 1)
   
@@ -829,6 +979,10 @@ approx_jointprobability <- function(target_d,rho,i,j,clid_i,clid_j,niter, env_ho
 }
 
 approx_jointprobability_linear_pool <- function(target_d,rho,pfunction_1,pfunction_2,niter){
+  
+  # specify a correlation
+  #rho=0.9
+  # choose a dose
   
   # sample from bivariate normal 
   Sigma <- matrix(c(1,rho,rho,1),2,2)
@@ -859,9 +1013,12 @@ get_linear_pool <- function(info,dose_curve,pfunc,expert = 'all'){
   cls = unique((info$cluster))
   do.call('rbind',lapply(1:length(cls),function(k){
     what <- info[info$cluster==cls[k],]
-    if(cls[k]=="Allergic lung inflammation " & expert != 'all'){
+    if(cls[k]=="Allergic lung inflammation" & expert != 'all'){
       what <- what[what$expert==expert,]
-    } 
+    }
+    if(cls[k]=="Cellular immunity " & expert != 'all'){
+      what <- what[what$expert==expert,]
+    }
     temp_lowup <- do.call('rbind', lapply(1:nrow(what),function(clid){
         pfunc[[what[clid,'i']]][[what[clid,'j']]]$pbmd(dose_curve)  
       }))
@@ -877,7 +1034,7 @@ get_linear_pool_list <- function(info,dose_curve,pfunc,expert = 'all'){
   cls = unique((info$cluster))
   lapply(1:length(cls),function(k){
     what <- info[info$cluster==cls[k],]
-    if(cls[k]=="Allergic lung inflammation " & expert != 'all'){
+    if(cls[k]=="Allergic lung inflammation" & expert != 'all'){
       what <- what[what$expert==expert,]
     } 
     temp_lowup <- do.call('rbind', lapply(1:nrow(what),function(clid){
@@ -891,3 +1048,59 @@ get_linear_pool_list <- function(info,dose_curve,pfunc,expert = 'all'){
   })
 }
 
+get_impagg <- function(info,dose_curve,pfunc){
+  cls = unique((info$cluster))
+  do.call('rbind',lapply(1:length(cls),function(k){
+    what <- info[info$cluster==cls[k],]
+      temp_lowup <- do.call('rbind', lapply(1:nrow(what),function(eid){
+        pfunc[[what[eid,'i']]][[what[eid,'j']]]$pbmd(dose_curve)  
+      }))
+      #objective <- function(po){
+      #sum(temp_lowup[,1]^2*(1-po)) + sum((1-temp_lowup[,2])^2*po)
+      #}
+      #optimize(objective, interval = range(temp_lowup))$minimum
+      ppo = seq(min(temp_lowup),max(temp_lowup),length.out=10^3)
+      ypo = unlist(lapply(ppo,function(po){
+        if(TRUE){
+          ## add brier type of measure here
+          mean(unlist(
+            lapply(1:nrow(temp_lowup),function(w){
+              if(po<temp_lowup[w,1]){
+                score = (po/temp_lowup[w,1])^2
+              }else if(po>temp_lowup[w,2]){
+                score = ((1-po)/(1-temp_lowup[w,2]))^2
+              }else{
+                score = (1 - (po<temp_lowup[w,1] | po>temp_lowup[w,2]))
+              }
+              return(score)
+            })))
+        }else if(FALSE){
+          ## linear
+        mean(unlist(
+        #prod(unlist(
+            lapply(1:nrow(temp_lowup),function(w){
+        if(po<temp_lowup[w,1]){
+          score = po/temp_lowup[w,1]
+        }else if(po>temp_lowup[w,2]){
+          score = (1-po)/(1-temp_lowup[w,2])
+          }else{
+          score = (1 - (po<temp_lowup[w,1] | po>temp_lowup[w,2]))
+          }
+        return(score)
+        })))#^(1/nrow(temp_lowup))
+        }else{
+        # zero outside range
+        mean(unlist(
+          lapply(1:nrow(temp_lowup),function(w){
+              score = (1 - (po<temp_lowup[w,1] | po>temp_lowup[w,2]))
+            return(score)
+          })))
+          }
+        
+        }))
+      #plot(ppo,ypo,type='l')
+      data.frame(lower_cdf = min(ppo[ypo == max(ypo)]),
+           upper_cdf=max(ppo[ypo == max(ypo)]),conf = max(ypo),dose = dose_curve,
+               cluster = rep(what$cluster[1],length(dose_curve)))
+  }))
+}
